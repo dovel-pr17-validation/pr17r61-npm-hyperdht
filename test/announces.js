@@ -1,0 +1,525 @@
+const test = require('brittle')
+const b4a = require('b4a')
+const cenc = require('compact-encoding')
+const messages = require('../lib/messages.js')
+const Persistent = require('../lib/persistent.js')
+const { swarm, toArray } = require('./helpers')
+const DHT = require('../')
+const HyperDHT = require('../')
+const Announcer = require('../lib/announcer')
+const { COMMANDS } = require('../lib/constants.js')
+
+test('server listen and findPeer', async function (t) {
+  const [a, b] = await swarm(t)
+
+  const server = a.createServer()
+  await server.listen()
+
+  const result = await toArray(b.findPeer(server.publicKey))
+
+  t.ok(result.length > 0, 'has at least one result')
+  t.alike(result[0].peer.publicKey, server.publicKey)
+})
+
+test('server listen and lookup', async function (t) {
+  const [a, b] = await swarm(t)
+
+  const server = a.createServer()
+  await server.listen()
+
+  const result = await toArray(b.lookup(server.target))
+
+  t.ok(result.length > 0, 'has at least one result')
+  t.alike(result[0].peers.length, 1)
+  t.alike(result[0].peers[0].publicKey, server.publicKey)
+})
+
+test('announce to group and lookup', async function (t) {
+  const [a, b] = await swarm(t)
+  const keyPair1 = DHT.keyPair()
+  const keyPair2 = DHT.keyPair()
+  const target = DHT.hash(Buffer.from('testing...'))
+
+  await a.announce(target, keyPair1, []).finished()
+
+  {
+    const result = await toArray(b.lookup(target))
+    t.ok(result.length > 0, 'has at least one result')
+    t.alike(result[0].peers.length, 1, 'one peer')
+    t.alike(result[0].peers[0].publicKey, keyPair1.publicKey)
+  }
+
+  await a.announce(target, keyPair2, [{ host: '1.2.3.4', port: 1234 }]).finished()
+
+  {
+    const result = await toArray(b.lookup(target))
+    t.ok(result.length > 0, 'has at least one result')
+
+    // Sort result by number of peers to first is more likely to have both announcements
+    // The test can return different set of nodes per lookup for announcing so
+    // two nodes can have gotten each one of the two announcements. This is
+    // expected in real execution as we don't know the network. Sorting makes
+    // the test stable.
+    const sortedByPeers = result.sort((a, b) => b.peers.length - a.peers.length)
+    t.alike(sortedByPeers[0].peers.length, 2, 'two peers')
+    t.alike(
+      [sortedByPeers[0].peers[0].publicKey, sortedByPeers[0].peers[1].publicKey].sort(),
+      [keyPair1.publicKey, keyPair2.publicKey].sort()
+    )
+
+    const latest =
+      sortedByPeers[0].peers[sortedByPeers[0].peers[0].publicKey.equals(keyPair2.publicKey) ? 0 : 1]
+
+    t.is(latest.relayAddresses.length, 1, 'announced one relay')
+    t.alike(latest.relayAddresses[0], { host: '1.2.3.4', port: 1234 })
+  }
+
+  for await (const data of a.findPeer(keyPair1.publicKey)) {
+    t.fail('peer should not be announced')
+    t.absent(data, 'just make standard happy')
+  }
+
+  for await (const data of a.findPeer(keyPair2.publicKey)) {
+    t.fail('peer should not be announced')
+    t.absent(data, 'just make standard happy')
+  }
+})
+
+test('announce to group and bump and lookup', async function (t) {
+  const [a, b] = await swarm(t)
+  const keyPair1 = DHT.keyPair()
+  const target = DHT.hash(Buffer.from('testing...'))
+
+  await a.announce(target, keyPair1, [], { bump: 1 }).finished()
+
+  {
+    const result = await toArray(b.lookup(target))
+    t.ok(result.length > 0, 'has at least one result')
+    t.is(result[0].bump, 1, 'expected bump')
+  }
+
+  await a.announce(target, keyPair1, [], { bump: 2 }).finished()
+
+  {
+    const result = await toArray(b.lookup(target))
+    t.ok(result.length > 0, 'has at least one result')
+    t.is(result[0].bump, 2, 'expected bump')
+  }
+
+  await a.announce(target, keyPair1, [], { bump: 1 }).finished()
+
+  {
+    const result = await toArray(b.lookup(target))
+    t.ok(result.length > 0, 'has at least one result')
+    t.is(result[0].bump, 2, 'bump is monotonic')
+  }
+
+  const now = Date.now()
+  const futureBump = now + 24 * 3600 * 1000
+
+  await a.announce(target, keyPair1, [], { bump: futureBump }).finished()
+
+  {
+    const result = await toArray(b.lookup(target))
+    t.ok(result.length > 0, 'has at least one result')
+    t.is(result[0].bump, 2, 'was ignored')
+  }
+
+  await a.announce(target, keyPair1, [], { bump: now }).finished()
+
+  {
+    const result = await toArray(b.lookup(target))
+    t.ok(result.length > 0, 'has at least one result')
+    t.is(result[0].bump, now, 'was applied')
+  }
+})
+
+test('announce null relay addresses', async function (t) {
+  const [a] = await swarm(t)
+  const keyPair = DHT.keyPair()
+  const target = DHT.hash(Buffer.from('testing...'))
+
+  await t.execution(a.announce(target, keyPair, null).finished())
+})
+
+test('server listen returns server', async function (t) {
+  const [a, b] = await swarm(t)
+
+  const server = await a.createServer().listen()
+  const result = await toArray(b.findPeer(server.publicKey))
+
+  t.ok(result.length > 0, 'has at least one result')
+  t.alike(result[0].peer.publicKey, server.publicKey)
+})
+
+test('server suspends and resumes', async function (t) {
+  const [a, b] = await swarm(t)
+  const server = await a.createServer().listen()
+
+  t.ok((await toArray(b.findPeer(server.publicKey))).length > 0)
+
+  await server.suspend()
+
+  t.ok((await toArray(b.findPeer(server.publicKey))).length === 0)
+
+  server.resume()
+
+  // be nice to have an api for the next announce cycle here...
+  await new Promise((resolve) => setTimeout(resolve, 1000))
+
+  t.ok((await toArray(b.findPeer(server.publicKey))).length > 0)
+})
+
+test('server suspends during listen', async function (t) {
+  const [a, b] = await swarm(t)
+  const server = a.createServer()
+  const queries = a.stats.queries.total
+
+  const listening = server.listen()
+  server.suspend()
+  server.resume()
+  await server.suspend()
+  await listening
+
+  t.is(a.stats.queries.total, queries, 'did not announce')
+
+  await server.resume()
+  await new Promise((resolve) => setTimeout(resolve, 1000))
+
+  t.ok((await toArray(b.findPeer(server.publicKey))).length > 0, 'announced after resume')
+})
+
+test('server suspends during first announce', async function (t) {
+  const [a, b] = await swarm(t)
+  const server = a.createServer()
+
+  const listening = server.listen()
+  await new Promise((resolve) => setImmediate(resolve))
+  await server.suspend()
+  await listening
+
+  t.is(server.relayAddresses.length, 0, 'did not announce')
+
+  await server.resume()
+  await new Promise((resolve) => setTimeout(resolve, 1000))
+
+  t.ok((await toArray(b.findPeer(server.publicKey))).length > 0, 'announced after resume')
+})
+
+test('server suspend does not retry unannounces', async function (t) {
+  const [a, ...nodes] = await swarm(t)
+  const server = await a.createServer().listen()
+
+  const restore = nodes.map(dropUnannounces)
+
+  const started = Date.now()
+  await server.suspend()
+  t.ok(Date.now() - started < 2500, 'did not retry')
+
+  for (const fn of restore) fn()
+})
+
+test('forced unannounce does not retry', async function (t) {
+  const [a, ...nodes] = await swarm(t)
+  const keyPair = DHT.keyPair()
+  const target = DHT.hash(b4a.from('testing...'))
+
+  await a.announce(target, keyPair, []).finished()
+
+  nodes.forEach(dropUnannounces)
+
+  const started = Date.now()
+  await a.unannounce(target, keyPair, { force: true })
+  t.ok(Date.now() - started < 2500, 'did not retry')
+})
+
+test('server announces relay addrs', async function (t) {
+  const [, a, b] = await swarm(t)
+
+  // ensure dht is fully connected...
+  await a.findNode(a.id).finished()
+  await b.findNode(b.id).finished()
+
+  const server = await a.createServer().listen()
+  const q = b.findPeer(server.publicKey)
+  const nodes = await toArray(q)
+
+  for (const addr of server.relayAddresses) {
+    let found = false
+
+    for (const node of nodes) {
+      found = node.from.port === addr.port && node.from.host === addr.host
+      if (found) break
+    }
+
+    if (!found) {
+      const { host, port } = b.remoteAddress()
+      found = port === addr.port && host === addr.host
+    }
+
+    if (!found) {
+      const { host, port } = a.remoteAddress()
+      found = port === addr.port && host === addr.host
+    }
+
+    t.ok(found, 'found addr')
+  }
+})
+
+test('announcer prefers lower rtt among close-enough replies', async function (t) {
+  const keyPair = DHT.keyPair()
+  const target = DHT.hash(Buffer.from('rtt-ranked-announces'))
+  const rtts = [80, 70, 20, 20, 40, 20, 60, 10, 1, 2]
+  const replies = rtts.map((rtt, i) => {
+    return {
+      token: b4a.alloc(32, i),
+      rtt,
+      from: {
+        id: b4a.alloc(32, i + 1),
+        host: '127.0.0.1',
+        port: 10000 + i
+      },
+      to: {
+        host: '127.0.0.1',
+        port: 20000 + i
+      }
+    }
+  })
+  const announced = []
+  const dht = {
+    firewalled: true,
+    destroyed: false,
+    findPeer() {
+      return {
+        closestReplies: replies,
+        closestNodes: replies.map((reply) => reply.from),
+        finished: () => Promise.resolve()
+      }
+    },
+    request(req, to) {
+      t.is(req.command, COMMANDS.ANNOUNCE)
+      announced.push(to.port)
+      return Promise.resolve({ error: 0 })
+    }
+  }
+  const announcer = new Announcer(dht, keyPair, target, {
+    signAnnounce: () => b4a.alloc(64)
+  })
+
+  await announcer._update()
+
+  t.alike(
+    announced,
+    [10007, 10002, 10003],
+    'announced to lowest-rtt replies and kept reply order for equal rtt'
+  )
+  t.absent(announced.includes(10008), 'ignored lower-rtt reply outside the candidate window')
+})
+
+test('connect when we relay ourself', async function (t) {
+  const testnet = await swarm(t)
+
+  const server = await testnet.nodes[1]
+    .createServer(function (sock) {
+      sock.resume()
+      sock.end()
+    })
+    .listen()
+
+  const addr = server.relayAddresses[server.relayAddresses.length - 1]
+
+  for (const node of testnet.nodes) {
+    const { host, port } = node.remoteAddress()
+    if (addr.port === port && addr.host === host) {
+      const sock = node.connect(server.publicKey)
+      await sock.opened
+      t.pass('worked')
+      sock.end()
+      await new Promise((resolve) => sock.once('close', resolve))
+      break
+    }
+  }
+})
+
+test('announcer background does not over-trigger', async function (t) {
+  // Note: Not a great test, since it accesses private prop of dht-rpc/io
+  // Feel free to remove this test if _tid behaviour changes, since it's
+  // mostly used to document a previous bug
+
+  const testnet = await swarm(t, 2) // must be <=3 (less than announcer MIN_ACTIVE) to trigger previous bug
+  const bootstrap = testnet.bootstrap
+
+  const a = new HyperDHT({ bootstrap })
+
+  const initTid = a.io._tid
+  const server = a.createServer()
+  await server.listen()
+
+  // give some time for possible background spam
+  await new Promise((resolve) => setTimeout(resolve, 500))
+
+  const requestsSent =
+    initTid > a.io._tid // it wrapped?
+      ? a.io._tid // close enough for this test (ignoring those before wrapping)
+      : a.io._tid - initTid
+
+  t.ok(requestsSent < 50, `No background spam of ping requests (saw ${requestsSent})`)
+
+  await a.destroy()
+})
+
+test('server retries announce if no relays were committed', async function (t) {
+  const testnet = await swarm(t)
+  const a = testnet.createNode() // ephemeral, so only findable through announces
+  const b = testnet.nodes[1]
+
+  let fail = true
+  let signs = 0
+  const server = a.createServer()
+  await server.listen(a.defaultKeyPair, {
+    signAnnounce(...args) {
+      signs++
+      if (fail) throw new Error('offline')
+      return Persistent.signAnnounce(...args)
+    }
+  })
+
+  t.is((await toArray(b.findPeer(server.publicKey))).length, 0, 'not announced')
+
+  const n = signs
+  await new Promise((resolve) => setTimeout(resolve, 4000))
+
+  t.ok(signs <= 2 * n, 'retries are paced')
+
+  fail = false
+
+  let found = false
+  for (let i = 0; i < 20 && !found; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    found = (await toArray(b.findPeer(server.publicKey))).length > 0
+  }
+
+  t.ok(found, 'announced')
+
+  const m = signs
+  await new Promise((resolve) => setTimeout(resolve, 4000))
+
+  t.is(signs, m, 'no retries once announced')
+})
+
+test('refresh-only announce does not crash persistent node', async function (t) {
+  const [a] = await swarm(t)
+  const keyPair = DHT.keyPair()
+  const target = DHT.hash(Buffer.from('refresh-only-test'))
+
+  // get a token
+  await a.announce(target, keyPair, []).finished()
+  let token = null
+  let from = null
+  for await (const node of a.lookup(target)) {
+    if (node.token) {
+      token = node.token
+      from = node.from
+      break
+    }
+  }
+  t.ok(token, 'got a token')
+  t.ok(from, 'got a from address')
+
+  const value = cenc.encode(messages.announce, {
+    peer: null,
+    refresh: b4a.alloc(32),
+    signature: null,
+    bump: 0
+  })
+
+  a.request({ command: COMMANDS.ANNOUNCE, target, token, value }, from).catch(() => {})
+  // Give some time to let remote crash (as it would before bugfix)
+  await new Promise((resolve) => setTimeout(resolve, 200))
+
+  t.pass('no remote crash')
+})
+
+test('announce with lookup forwards announce replies', async function (t) {
+  const [a, b] = await swarm(t)
+  const keyPair1 = DHT.keyPair()
+  const keyPair2 = DHT.keyPair()
+  const target = DHT.hash(Buffer.from('testing lookup flag...'))
+
+  await a.announce(target, keyPair1, []).finished()
+
+  const result = await toArray(b.announce(target, keyPair2, [], { lookup: true }))
+
+  t.ok(result.length > 0, 'has at least one result')
+
+  // the lookup replies are emitted before the announce, so only the forwarded
+  // announce replies can contain keyPair2
+  const fromAnnounce = result.filter((data) =>
+    data.peers.some((p) => p.publicKey.equals(keyPair2.publicKey))
+  )
+
+  t.ok(fromAnnounce.length > 0, 'announce replies are forwarded on the stream')
+
+  const sortedByPeers = fromAnnounce.sort((a, b) => b.peers.length - a.peers.length)
+  t.is(sortedByPeers[0].peers.length, 2, 'two peers')
+  t.alike(
+    [sortedByPeers[0].peers[0].publicKey, sortedByPeers[0].peers[1].publicKey].sort(),
+    [keyPair1.publicKey, keyPair2.publicKey].sort()
+  )
+})
+
+test('announce auto sets lookup when a node returned no peers', async function (t) {
+  const [a, b] = await swarm(t)
+  const keyPair = DHT.keyPair()
+  const target = DHT.hash(Buffer.from('testing auto lookup flag...'))
+
+  const result = await toArray(b.announce(target, keyPair, []))
+
+  t.ok(result.length > 0, 'has at least one result')
+
+  const fromAnnounce = result.filter((data) =>
+    data.peers.some((p) => p.publicKey.equals(keyPair.publicKey))
+  )
+
+  t.ok(fromAnnounce.length > 0, 'announce replies are forwarded on the stream')
+})
+
+test('announce with lookup false does not forward announce replies', async function (t) {
+  const [a, b] = await swarm(t)
+  const keyPair = DHT.keyPair()
+  const target = DHT.hash(Buffer.from('testing no lookup flag...'))
+
+  const result = await toArray(b.announce(target, keyPair, [], { lookup: false }))
+
+  t.is(result.length, 0, 'doesnt return a result')
+})
+
+test('announce with lookup and clear', async function (t) {
+  const [a, b] = await swarm(t)
+  const keyPair = DHT.keyPair()
+  const target = DHT.hash(Buffer.from('testing lookup flag and clear...'))
+
+  await a.announce(target, keyPair, [{ host: '1.2.3.4', port: 1234 }]).finished()
+
+  const result = await toArray(b.announce(target, keyPair, [], { lookup: true, clear: true }))
+
+  t.ok(result.length > 0, 'has at least one result')
+
+  const fromAnnounce = result.filter(
+    (data) => data.peers.length === 1 && data.peers[0].relayAddresses.length === 0
+  )
+
+  t.ok(fromAnnounce.length > 0, 'announce replies with the replaced record are forwarded')
+  for (const data of fromAnnounce) t.alike(data.peers[0].publicKey, keyPair.publicKey)
+})
+
+function dropUnannounces(node) {
+  const onrequest = node.onrequest
+  node.onrequest = function (req) {
+    if (req.command === COMMANDS.UNANNOUNCE) return true
+    return onrequest.call(this, req)
+  }
+  return () => {
+    node.onrequest = onrequest
+  }
+}

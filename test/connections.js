@@ -1,0 +1,1079 @@
+const test = require('brittle')
+const { swarm, createDHT, endAndCloseSocket } = require('./helpers')
+const { encode } = require('hypercore-id-encoding')
+const { once } = require('events')
+const DHT = require('../')
+const NoiseWrap = require('../lib/noise-wrap')
+const { FIREWALL, ERROR } = require('../lib/constants')
+const { unslabbedHash } = require('../lib/crypto')
+
+test('createServer + connect - once defaults', async function (t) {
+  t.plan(2)
+
+  const [a, b] = await swarm(t)
+  const lc = t.test('socket lifecycle')
+
+  lc.plan(4)
+
+  const server = a.createServer(function (socket) {
+    lc.pass('server side opened')
+
+    socket.once('end', function () {
+      lc.pass('server side ended')
+      socket.end()
+    })
+  })
+
+  await server.listen()
+
+  const socket = b.connect(server.publicKey)
+
+  socket.once('open', function () {
+    lc.pass('client side opened')
+  })
+
+  socket.once('end', function () {
+    lc.pass('client side ended')
+  })
+
+  socket.end()
+
+  await lc
+
+  server.on('close', function () {
+    t.pass('server closed')
+  })
+
+  await server.close()
+})
+
+test('createServer + connect - emits connect', async function (t) {
+  t.plan(2)
+
+  const [a, b] = await swarm(t)
+  const lc = t.test('socket lifecycle')
+
+  lc.plan(4)
+
+  const server = a.createServer(function (socket) {
+    lc.pass('server side opened')
+
+    socket.once('end', function () {
+      lc.pass('server side ended')
+      socket.end()
+    })
+  })
+
+  await server.listen()
+
+  const socket = b.connect(server.publicKey)
+
+  socket.once('connect', function () {
+    lc.pass('client side emitted connect')
+  })
+
+  socket.once('end', function () {
+    lc.pass('client side ended')
+  })
+
+  socket.end()
+
+  await lc
+
+  server.on('close', function () {
+    t.pass('server closed')
+  })
+
+  await server.close()
+})
+
+test('createServer + connect - exchange data', { timeout: 60000 }, async function (t) {
+  const [a, b] = await swarm(t)
+  const lc = t.test('socket lifecycle')
+
+  lc.plan(5)
+
+  const server = a.createServer(function (socket) {
+    lc.pass('server side opened')
+
+    socket.on('data', function (data) {
+      socket.write(data)
+    })
+
+    socket.once('end', function () {
+      lc.pass('server side ended')
+      socket.end()
+    })
+  })
+
+  await server.listen()
+
+  const socket = b.connect(server.publicKey)
+  const blk = Buffer.alloc(4096)
+  const expected = 20 * 1024 * blk.byteLength
+
+  let sent = 0
+  let recv = 0
+
+  for (let i = 0; i < 10; i++) send()
+
+  function send() {
+    sent += blk.byteLength
+    socket.write(blk)
+  }
+
+  socket.on('data', function (data) {
+    recv += data.byteLength
+    if (recv === expected) {
+      lc.is(sent, expected, 'client sent all data')
+      lc.is(recv, expected, 'client received all data')
+      socket.end()
+    } else if (sent < expected) {
+      send()
+    }
+  })
+
+  socket.once('end', function () {
+    lc.pass('client side ended')
+  })
+
+  await lc
+  await server.close()
+})
+
+test('createServer + connect - force holepunch', async function (t) {
+  const [boot] = await swarm(t)
+
+  const bootstrap = [{ host: '127.0.0.1', port: boot.address().port }]
+  const a = createDHT({ bootstrap, quickFirewall: false, ephemeral: true })
+  const b = createDHT({ bootstrap, quickFirewall: false, ephemeral: true })
+
+  await a.fullyBootstrapped()
+  await b.fullyBootstrapped()
+
+  const lc = t.test('socket lifecycle')
+  lc.plan(4)
+
+  const server = a.createServer({ shareLocalAddress: false }, function (socket) {
+    lc.pass('udx server side opened')
+
+    socket.once('end', function () {
+      lc.pass('udx server side ended')
+      socket.end()
+    })
+  })
+
+  await server.listen()
+
+  const socket = b.connect(server.publicKey, { localConnection: false })
+
+  socket.once('open', function () {
+    lc.pass('udx client side opened')
+  })
+
+  socket.once('end', function () {
+    lc.pass('udx client side ended')
+  })
+
+  socket.end()
+
+  await lc
+
+  await server.close()
+  await a.destroy()
+  await b.destroy()
+})
+
+test('createServer + connect - failed LAN ping falls back to holepunch', async function (t) {
+  const { bootstrap } = await swarm(t)
+
+  // The test nodes bind to loopback, which deterministically enters the
+  // same-LAN shortcut. This does not model NAT; the injected ping failure
+  // below verifies that a blocked LAN shortcut still falls through to normal
+  // holepunch.
+  const a = createDHT({ bootstrap, quickFirewall: false, ephemeral: true })
+  const b = createDHT({ bootstrap, quickFirewall: false, ephemeral: true })
+
+  await a.fullyBootstrapped()
+  await b.fullyBootstrapped()
+
+  const lc = t.test('socket lifecycle')
+  lc.plan(5)
+
+  const server = a.createServer(function (socket) {
+    lc.pass('server side opened')
+
+    socket.once('data', function (data) {
+      lc.alike(data, Buffer.from('hello'))
+      socket.end('world')
+    })
+  })
+
+  await server.listen()
+
+  const serverPort = a.io.serverSocket.address().port
+  const ping = b.ping.bind(b)
+  let blockedLanPing = false
+
+  b.ping = function (addr, opts) {
+    if (addr.host === '127.0.0.1' && addr.port === serverPort) {
+      blockedLanPing = true
+      return Promise.reject(new Error('LAN ping blocked'))
+    }
+    return ping(addr, opts)
+  }
+
+  const socket = b.connect(server.publicKey, {
+    fastOpen: false,
+    holepunch() {
+      lc.pass('client used normal holepunch')
+      return true
+    }
+  })
+
+  socket.once('open', function () {
+    lc.pass('client side opened')
+    socket.write('hello')
+  })
+
+  socket.once('data', function (data) {
+    lc.alike(data, Buffer.from('world'))
+    socket.end()
+  })
+
+  socket.once('error', function (err) {
+    lc.fail('client should not error: ' + err.code)
+  })
+
+  await lc
+
+  t.ok(blockedLanPing, 'exercised the LAN ping failure path')
+
+  await server.close()
+  await a.destroy()
+  await b.destroy()
+})
+
+test('createServer + connect - same-LAN explicit keypair opens server', async function (t) {
+  // Regression: advertising the prepunch socket as the server address can make
+  // the client mark punching done before the LAN shortcut opens the stream.
+  const { bootstrap } = await swarm(t, 3)
+
+  const a = new DHT({ bootstrap })
+  const b = new DHT({ bootstrap })
+
+  await a.fullyBootstrapped()
+  await b.fullyBootstrapped()
+
+  const serverKeyPair = DHT.keyPair()
+  const clientKeyPair = DHT.keyPair()
+  const lc = t.test('socket lifecycle')
+  lc.plan(2)
+
+  const server = a.createServer(function (socket) {
+    lc.pass('server side opened')
+
+    socket.once('end', function () {
+      socket.end()
+    })
+  })
+
+  await server.listen(serverKeyPair)
+
+  const socket = b.connect(serverKeyPair.publicKey, {
+    keyPair: clientKeyPair
+  })
+
+  socket.once('open', function () {
+    lc.pass('client side opened')
+  })
+
+  socket.once('error', function (err) {
+    lc.fail('client should not error: ' + err.code)
+  })
+
+  await lc
+
+  await endAndCloseSocket(socket)
+  await server.close()
+  await a.destroy()
+  await b.destroy()
+})
+
+test('createServer + connect - pending LAN survives incomplete NAT analysis', async function (t) {
+  // Keep both endpoints cold. Three testnet nodes provide only two samples to
+  // the server puncher, so coordinated NAT analysis cannot finish before LAN.
+  const { bootstrap } = await swarm(t, 3)
+  const serverDHT = new DHT({ bootstrap })
+  const clientDHT = new DHT({ bootstrap })
+  t.teardown(async () => {
+    await serverDHT.destroy()
+    await clientDHT.destroy()
+  })
+
+  const server = serverDHT.createServer(function (socket) {
+    socket.on('error', () => {})
+    socket.end('pong')
+  })
+
+  await server.listen()
+
+  const serverPort = serverDHT.io.serverSocket.address().port
+  const ping = clientDHT.ping
+  const peerHolepunch = clientDHT._router.peerHolepunch
+  let holepunchSettled
+  let delayedLan = false
+  const firstHolepunchSettled = new Promise((resolve) => (holepunchSettled = resolve))
+
+  clientDHT.ping = async function (addr, opts) {
+    if (addr.port === serverPort) {
+      delayedLan = true
+      await firstHolepunchSettled
+    }
+
+    return ping.call(this, addr, opts)
+  }
+
+  clientDHT._router.peerHolepunch = async function (...args) {
+    try {
+      return await peerHolepunch.apply(this, args)
+    } finally {
+      holepunchSettled()
+    }
+  }
+
+  const socket = clientDHT.connect(server.publicKey, { fastOpen: false })
+  socket.on('error', () => {})
+
+  const [data] = await once(socket, 'data')
+  t.alike(data, Buffer.from('pong'))
+  t.ok(delayedLan, 'delayed LAN until the first holepunch request settled')
+
+  await endAndCloseSocket(socket)
+})
+
+test('server choosing to abort holepunch', async function (t) {
+  const [boot] = await swarm(t)
+
+  const bootstrap = [{ host: '127.0.0.1', port: boot.address().port }]
+  const a = createDHT({ bootstrap, quickFirewall: false, ephemeral: true })
+  const b = createDHT({ bootstrap, quickFirewall: false, ephemeral: true })
+
+  await a.fullyBootstrapped()
+  await b.fullyBootstrapped()
+
+  const lc = t.test('socket lifecycle')
+  lc.plan(2)
+
+  const server = a.createServer(
+    {
+      shareLocalAddress: false,
+      holepunch() {
+        lc.pass('server should trigger holepuncher hook')
+        return false
+      }
+    },
+    function (socket) {
+      lc.fail('server should not make a connection')
+    }
+  )
+
+  await server.listen()
+
+  const socket = b.connect(server.publicKey, {
+    fastOpen: false,
+    localConnection: false
+  })
+
+  socket.once('open', function () {
+    lc.fail('client should not make a connection')
+  })
+
+  socket.once('error', function (err) {
+    lc.ok(!!err, 'client socket should error')
+  })
+
+  await lc
+
+  await server.close()
+  await a.destroy()
+  await b.destroy()
+})
+
+test('client choosing to abort holepunch', async function (t) {
+  const [boot] = await swarm(t)
+
+  const bootstrap = [{ host: '127.0.0.1', port: boot.address().port }]
+  const a = createDHT({ bootstrap, quickFirewall: false, ephemeral: true })
+  const b = createDHT({ bootstrap, quickFirewall: false, ephemeral: true })
+
+  await a.fullyBootstrapped()
+  await b.fullyBootstrapped()
+
+  const lc = t.test('socket lifecycle')
+  lc.plan(2)
+
+  const server = a.createServer({ shareLocalAddress: false }, function (socket) {
+    lc.fail('server should not make a connection')
+  })
+
+  await server.listen()
+
+  const socket = b.connect(server.publicKey, {
+    fastOpen: false,
+    localConnection: false,
+    holepunch() {
+      lc.pass('client is aborting')
+      return false
+    }
+  })
+
+  socket.once('open', function () {
+    lc.fail('client should not make a connection')
+  })
+
+  socket.once('error', function (err) {
+    lc.ok(!!err, 'client socket should error')
+  })
+
+  await lc
+
+  await server.close()
+  await a.destroy()
+  await b.destroy()
+})
+
+test('udp noise, client ends, no crash', async function (t) {
+  const [, node] = await swarm(t, 2)
+
+  const socket = node.udx.createSocket()
+  await socket.send(Buffer.from('hi'), node.address().port)
+  await socket.close()
+
+  t.pass('did not crash')
+})
+
+test('half open', async function (t) {
+  t.plan(2)
+
+  const [a, b] = await swarm(t)
+
+  const server = a.createServer()
+  await server.listen()
+
+  const socket = b.connect(server.address().publicKey)
+
+  server.on('connection', (socket) => {
+    socket.on('data', (data) => {
+      t.alike(data.toString(), 'ping')
+      setTimeout(() => socket.end('pong'))
+    })
+  })
+
+  socket
+    .on('data', (data) => {
+      t.alike(data.toString(), 'pong')
+    })
+    .end('ping')
+})
+
+test('server responds and immediately ends, multiple connects', async function (t) {
+  const [a, b] = await swarm(t)
+
+  const lc = t.test('socket lifecycle')
+  lc.plan(1)
+
+  const server = a.createServer((socket) => {
+    socket.end('hi')
+  })
+
+  await server.listen()
+
+  // TODO: the test fails due to congestion when this is too high
+  let n = 10
+
+  for (let i = n; i > 0; i--) {
+    const socket = b.connect(server.publicKey)
+
+    socket
+      .on('close', () => {
+        if (--n === 0) lc.pass()
+      })
+      .resume()
+      .end()
+  }
+
+  await lc
+
+  await server.close()
+})
+
+test('dht node can host server', async function (t) {
+  t.plan(2)
+
+  const [, b, c] = await swarm(t, 3)
+
+  const lc = t.test('socket lifecycle')
+
+  lc.plan(4)
+
+  const server = b.createServer(function (socket) {
+    lc.pass('server side opened')
+
+    socket.once('end', function () {
+      lc.pass('server side ended')
+      socket.end()
+    })
+  })
+
+  await server.listen()
+
+  const socket = c.connect(server.publicKey)
+
+  socket.once('open', function () {
+    lc.pass('client side opened')
+  })
+
+  socket.once('end', function () {
+    lc.pass('client side ended')
+  })
+
+  socket.end()
+
+  await lc
+
+  server.on('close', function () {
+    t.pass('server closed')
+  })
+
+  await server.close()
+})
+
+test('server and client on same node', async function (t) {
+  t.plan(2)
+
+  const [, a] = await swarm(t)
+
+  const server = a.createServer()
+  await server.listen()
+
+  const socket = a.connect(server.address().publicKey)
+
+  server.on('connection', (socket) => {
+    t.pass('server connected')
+    socket.end()
+  })
+
+  socket.on('open', () => {
+    t.pass('client connected')
+    socket.end()
+  })
+})
+
+test('relayed connection', async function (t) {
+  t.plan(2)
+
+  const nodes = await swarm(t)
+
+  const a = nodes.createNode()
+  const b = nodes.createNode()
+
+  const server = a.createServer()
+  await server.listen()
+
+  const socket = b.connect(server.address().publicKey)
+
+  server.on('connection', (socket) => {
+    socket.on('error', () => {})
+    t.pass('server connected')
+    socket.end()
+  })
+
+  socket
+    .on('error', () => {})
+    .on('open', () => {
+      t.pass('client connected')
+      socket.end()
+    })
+})
+
+test('relayed connection on same node', async function (t) {
+  t.plan(4)
+
+  const nodes = await swarm(t)
+
+  const a = nodes.createNode()
+
+  const server = a.createServer()
+  await server.listen()
+
+  const socket = a.connect(server.address().publicKey)
+
+  server.on('connection', (socket) => {
+    t.pass('server connected')
+    socket.end()
+
+    socket.on('close', function () {
+      t.pass('server socket closed')
+    })
+  })
+
+  socket.on('open', () => {
+    t.pass('client connected')
+    socket.end()
+  })
+
+  socket.on('close', function () {
+    t.pass('client socket closed')
+  })
+})
+
+test('create raw stream from encrypted stream', async function (t) {
+  const msg = t.test('message')
+  msg.plan(1)
+
+  const [a, b] = await swarm(t)
+
+  const server = a.createServer()
+  await server.listen()
+
+  const socket = b.connect(server.address().publicKey)
+
+  const aRawStream = a.createRawStream()
+  const bRawStream = b.createRawStream()
+
+  server.on('connection', (socket) => {
+    socket.on('error', () => {})
+
+    DHT.connectRawStream(socket, aRawStream, bRawStream.id)
+
+    aRawStream.write('hello')
+  })
+
+  socket.on('open', () => {
+    DHT.connectRawStream(socket, bRawStream, aRawStream.id)
+
+    bRawStream.on('data', (data) => {
+      msg.alike(data, Buffer.from('hello'))
+
+      socket.destroy()
+    })
+  })
+
+  await msg
+
+  aRawStream.destroy()
+  bRawStream.destroy()
+
+  await server.close()
+})
+
+test('create many connections with reusable sockets', async function (t) {
+  const [boot] = await swarm(t)
+
+  const bootstrap = [{ host: '127.0.0.1', port: boot.address().port }]
+  const a = createDHT({ bootstrap, quickFirewall: false, ephemeral: true })
+  const b = createDHT({ bootstrap, quickFirewall: false, ephemeral: true })
+
+  await a.fullyBootstrapped()
+  await b.fullyBootstrapped()
+
+  const server = a.createServer({ reusableSocket: true })
+  await server.listen()
+
+  server.on('connection', function (socket) {
+    socket.write('Hello, World!')
+    socket.end()
+  })
+
+  let prev = null
+  let same = 0
+
+  for (let i = 0; i < 100; i++) {
+    const socket = b.connect(server.address().publicKey, {
+      reusableSocket: true,
+      localConnection: false
+    })
+
+    socket.on('connect', function () {
+      if (prev === socket.rawStream.socket) same++
+      prev = socket.rawStream.socket
+    })
+
+    socket.resume()
+    socket.end()
+    await new Promise((resolve) => socket.once('end', resolve))
+  }
+
+  t.is(same, 99, 'reused socket')
+
+  for (let i = 0; i < 100; i++) {
+    const socket = b.connect(server.address().publicKey, {
+      reusableSocket: false,
+      localConnection: false
+    })
+
+    socket.on('connect', function () {
+      if (prev === socket.rawStream.socket) same++
+      prev = socket.rawStream.socket
+    })
+
+    socket.resume()
+    socket.end()
+    await new Promise((resolve) => socket.once('end', resolve))
+  }
+
+  t.is(same, 99, 'did not reuse socket')
+
+  await server.close()
+  await a.destroy()
+  await b.destroy()
+})
+
+test('connect using specific key', async function (t) {
+  const [a, b] = await swarm(t)
+
+  const lc = t.test('socket lifecycle')
+  lc.plan(4)
+
+  const keyPair = DHT.keyPair(Buffer.alloc(32, 'hello world'))
+  t.comment('publicKey', keyPair.publicKey)
+
+  const server = a.createServer(function (socket) {
+    lc.pass('server side opened')
+    t.alike(socket.remotePublicKey, keyPair.publicKey)
+
+    socket.once('end', function () {
+      lc.pass('server side ended')
+      socket.end()
+    })
+  })
+
+  await server.listen()
+
+  const socket = b.connect(server.publicKey, { keyPair })
+
+  socket
+    .once('open', function () {
+      lc.pass('client side opened')
+      t.alike(socket.publicKey, keyPair.publicKey)
+    })
+    .once('end', function () {
+      lc.pass('client side ended')
+    })
+    .end()
+
+  await lc
+
+  server.on('close', function () {
+    t.pass('server closed')
+  })
+
+  await server.close()
+})
+
+test('close connections on destroy', async function (t) {
+  const [a, b] = await swarm(t)
+  const open = t.test('open')
+  const close = t.test('close')
+
+  open.plan(2)
+  close.plan(2)
+
+  const server = a.createServer(function (socket) {
+    open.pass('server side opened')
+
+    socket
+      .on('error', () => {})
+      .once('close', function () {
+        close.pass('server side closed')
+      })
+  })
+
+  await server.listen()
+
+  const socket = b.connect(server.publicKey)
+
+  socket
+    .on('error', () => {})
+    .once('open', function () {
+      open.pass('client side opened')
+    })
+    .once('close', function () {
+      close.pass('client side closed')
+    })
+
+  server.on('close', function () {
+    t.pass('server closed')
+  })
+
+  await open
+
+  await a.destroy()
+  await b.destroy()
+
+  await close
+})
+
+test('connect using id instead of buffer', async function (t) {
+  t.plan(2)
+
+  const [a, b] = await swarm(t)
+  const server = a.createServer()
+  server.on('connection', (conn) => {
+    conn.on('end', () => conn.end())
+  })
+
+  await server.listen()
+
+  const id = encode(server.publicKey)
+  const socket = b.connect(id)
+
+  await once(socket, 'open')
+
+  t.is(id.length, 52)
+  t.pass('connects if id is given instead of buffer')
+
+  await endAndCloseSocket(socket)
+  await server.close()
+
+  await a.destroy()
+  await b.destroy()
+})
+
+test('exception if invalid id is used', async function (t) {
+  t.plan(1)
+
+  const [a] = await swarm(t)
+  const id = 'wrong-id'
+
+  try {
+    a.connect(id)
+    t.fail()
+  } catch (err) {
+    t.is(err.message, 'Invalid Hypercore key')
+    await a.destroy()
+  }
+})
+
+test('exception if null id is used', async function (t) {
+  t.plan(1)
+
+  const [a] = await swarm(t)
+
+  try {
+    a.connect(null)
+    t.fail()
+  } catch (err) {
+    t.is(err.message, 'Invalid Hypercore key')
+    await a.destroy()
+  }
+})
+
+test('connectionKeepAlive defaults to 5000', async function (t) {
+  t.plan(4)
+
+  const [a, b] = await swarm(t)
+  t.is(a.connectionKeepAlive, 5000, 'sanity check: connectionKeepAlive set to 5000')
+  t.is(b.connectionKeepAlive, 5000, 'sanity check: connectionKeepAlive set to 5000')
+
+  const server = a.createServer((socket) => {
+    socket.on('error', () => {})
+    t.is(socket.keepAlive, 5000, 'keepAlive set for server socket')
+  })
+
+  await server.listen()
+
+  const socket = b.connect(server.publicKey)
+  socket.on('error', () => {})
+
+  t.is(socket.keepAlive, 5000, 'keepAlive set for client socket')
+})
+
+test('connectionKeepAlive can be turned off', async function (t) {
+  t.plan(4)
+
+  const { bootstrap } = await swarm(t)
+
+  const a = createDHT({ bootstrap, connectionKeepAlive: false })
+  const b = createDHT({ bootstrap, connectionKeepAlive: false })
+  t.teardown(async () => {
+    await a.destroy()
+    await b.destroy()
+  })
+
+  t.is(a.connectionKeepAlive, 0, 'sanity check')
+  t.is(b.connectionKeepAlive, 0, 'sanity check')
+
+  const server = a.createServer((socket) => {
+    socket.on('error', () => {})
+    t.is(socket.keepAlive, 0, 'keepAlive not set for server socket')
+  })
+
+  await server.listen()
+
+  const socket = b.connect(server.publicKey)
+  socket.on('error', () => {})
+
+  t.is(socket.keepAlive, 0, 'keepAlive not set for client socket')
+})
+
+test('connectionKeepAlive passed to server and connection', async function (t) {
+  const allChecks = t.test('all') // hack so we can await plan
+  allChecks.plan(2)
+
+  const { bootstrap } = await swarm(t)
+
+  const a = createDHT({ bootstrap, connectionKeepAlive: 10000 })
+  const b = createDHT({ bootstrap, connectionKeepAlive: 20000 })
+
+  const server = a.createServer((socket) => {
+    socket.on('end', () => socket.end())
+    allChecks.is(socket.keepAlive, 10000, 'keepAlive set for server')
+  })
+
+  await server.listen()
+
+  const socket = b.connect(server.publicKey)
+
+  allChecks.is(socket.keepAlive, 20000, 'keepAlive set for connection')
+
+  await allChecks
+
+  await endAndCloseSocket(socket)
+
+  await server.close()
+
+  await a.destroy()
+  await b.destroy()
+})
+
+test('bootstrap with suggested-IP', async function (t) {
+  const [boot] = await swarm(t, 1)
+  const bootstrap = ['127.0.0.1@invalid:' + boot.address().port]
+  const a = createDHT({ bootstrap, quickFirewall: false, ephemeral: false })
+  await a.fullyBootstrapped()
+
+  t.alike(boot.toArray(), [{ host: '127.0.0.1', port: a.address().port }])
+
+  await a.destroy()
+})
+
+test('Populate DHT with options.nodes', async function (t) {
+  const a = createDHT({ bootstrap: [] })
+  await a.fullyBootstrapped()
+  const nodes = [{ host: '127.0.0.1', port: a.address().port }]
+
+  const b = createDHT({ nodes, bootstrap: [] })
+  await b.fullyBootstrapped()
+
+  t.alike(b.toArray(), [{ host: '127.0.0.1', port: a.address().port }])
+
+  a.destroy()
+  b.destroy()
+})
+
+test('create server with handshakeClearWait opt', async function (t) {
+  const [a] = await swarm(t)
+
+  {
+    const server = a.createServer({ handshakeClearWait: 123 })
+    t.is(server.handshakeClearWait, 123)
+  }
+  {
+    const server = a.createServer({})
+    t.is(server.handshakeClearWait, 10000, 'expected default')
+  }
+})
+
+test('peer cant flood w/ handshakes', async function (t) {
+  const [a, b] = await swarm(t, 2)
+  const server = a.createServer()
+  await server.listen()
+
+  t.is(server._connects.size, 0, 'server starts w/ 0 connections')
+  t.is(server._holepunches.length, 0, 'server starts w/ 0 holepunches')
+
+  // Create a single noise handshake to reuse across many requests
+  const handshake = new NoiseWrap(b.defaultKeyPair, server.publicKey)
+  const rawStream = b.createRawStream({ framed: true, firewall: () => false })
+  const noise = await handshake.send({
+    error: ERROR.NONE,
+    firewall: FIREWALL.UNKNOWN,
+    holepunch: null,
+    addresses4: [],
+    addresses6: [],
+    udx: {
+      reusableSocket: false,
+      id: rawStream.id,
+      seq: 0
+    },
+    secretStream: {},
+    relayThrough: null
+  })
+
+  const target = unslabbedHash(server.publicKey)
+  const to = { host: server.address().host, port: server.address().port }
+
+  const totalRequests = 10
+  const requests = []
+  for (let i = 0; i < totalRequests; i++) {
+    requests.push(b._router.peerHandshake(target, { noise, socket: null }, to))
+  }
+
+  await Promise.all(requests)
+
+  t.is(server._connects.size, 1, 'server only registered 1 connect')
+  t.is(server._holepunches.length, 1, 'server only registered 1 holepunch')
+
+  rawStream.destroy()
+  await server.close()
+})
+
+test('handshakes that arrive while the server is suspended are cleared', async function (t) {
+  const [a] = await swarm(t)
+
+  const handshakeClearWait = 100
+  const server = a.createServer({ handshakeClearWait }, () => {})
+  await server.listen()
+  t.teardown(() => server.close())
+
+  t.is(server._connects.size, 0, 'server starts w/ 0 connections')
+  t.is(server._holepunches.length, 0, 'server starts w/ 0 holepunches')
+
+  // Suspend server so incomming PEER_HANDSHAKEs bail in `_addHandshake()`
+  await server.suspend()
+
+  const handshake = new NoiseWrap(a.defaultKeyPair, server.publicKey)
+  const noise = await handshake.send({
+    error: ERROR.NONE,
+    firewall: FIREWALL.UNKNOWN,
+    holepunch: null,
+    addresses4: [],
+    addresses6: [],
+    udx: { reusableSocket: false, id: 0, seq: 0 },
+    secretStream: {},
+    relayThrough: null
+  })
+
+  const fakePeerAddress = { host: '203.0.113.5', port: 12345 } // unroutable
+  const req = { to: server.address(), from: fakePeerAddress, socket: null }
+
+  const reply = await server._onpeerhandshake({ noise, peerAddress: fakePeerAddress }, req)
+
+  t.absent(reply, 'sanity: the suspended server did not reply to the handshake')
+  t.is(
+    server._connects.size,
+    1,
+    'sanity: _addHandshake still registered itself despite being suspended'
+  )
+  t.is(server._holepunches.length, 1, 'sanity: ... and claimed a holepunch slot for it too')
+
+  // Wait for handshakeClearWait timeout
+  await new Promise((resolve) => setTimeout(resolve, handshakeClearWait + 100))
+
+  await server.resume()
+
+  t.is(server._connects.size, 0, 'the handshake entry should eventually be cleaned up')
+  t.is(server._holepunches.length, 0, '... and so should the holepunch slot')
+})
